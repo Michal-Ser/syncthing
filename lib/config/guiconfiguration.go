@@ -35,6 +35,9 @@ type GUIConfiguration struct {
 	SendBasicAuthPrompt       bool     `json:"sendBasicAuthPrompt" xml:"sendBasicAuthPrompt,attr"`
 	SessionCookieDurationS    int      `json:"sessionCookieDurationS" xml:"sessionCookieDurationS,omitempty" default:"604800"`
 	SessionCookiePath         string   `json:"sessionCookiePath" xml:"sessionCookiePath,omitempty" default:"/"`
+	ProxyAuthHeader           string   `json:"proxyAuthHeader" xml:"proxyAuthHeader,omitempty"`
+	ProxyAuthTrustedNets      string   `json:"proxyAuthTrustedNets" xml:"proxyAuthTrustedNets,omitempty"`
+	ProxyAuthAllowedUsers     string   `json:"proxyAuthAllowedUsers" xml:"proxyAuthAllowedUsers,omitempty"`
 }
 
 func (c GUIConfiguration) IsAuthEnabled() bool {

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"slices"
 	"strings"
 	"time"
@@ -130,15 +131,30 @@ type basicAuthAndSessionMiddleware struct {
 	ldapCfg            config.LDAPConfiguration
 	next               http.Handler
 	evLogger           events.Logger
+	proxyAuthNets      []netip.Prefix
 }
 
 func newBasicAuthAndSessionMiddleware(tokenCookieManager *tokenCookieManager, guiCfg config.GUIConfiguration, ldapCfg config.LDAPConfiguration, next http.Handler, evLogger events.Logger) *basicAuthAndSessionMiddleware {
+	var proxyAuthNets []netip.Prefix
+	for _, cidr := range strings.Split(guiCfg.ProxyAuthTrustedNets, ",") {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			slog.Warn("Ignoring invalid trusted proxy network", slog.String("network", cidr), slogutil.Error(err))
+			continue
+		}
+		proxyAuthNets = append(proxyAuthNets, prefix.Masked())
+	}
 	return &basicAuthAndSessionMiddleware{
 		tokenCookieManager: tokenCookieManager,
 		guiCfg:             guiCfg,
 		ldapCfg:            ldapCfg,
 		next:               next,
 		evLogger:           evLogger,
+		proxyAuthNets:      proxyAuthNets,
 	}
 }
 
@@ -149,6 +165,13 @@ func (m *basicAuthAndSessionMiddleware) ServeHTTP(w http.ResponseWriter, r *http
 	}
 
 	if m.tokenCookieManager.hasValidSession(r) {
+		m.next.ServeHTTP(w, r)
+		return
+	}
+
+	// Accept the username set by a trusted authenticating reverse proxy
+	if username, ok := m.attemptProxyAuth(r); ok {
+		m.tokenCookieManager.createSession(username, false, w, r)
 		m.next.ServeHTTP(w, r)
 		return
 	}
@@ -197,6 +220,49 @@ func (m *basicAuthAndSessionMiddleware) passwordAuthHandler(w http.ResponseWrite
 	emitLoginAttempt(false, req.Username, r, m.evLogger)
 	antiBruteForceSleep()
 	forbidden(w)
+}
+
+// attemptProxyAuth returns the username from the configured proxy auth
+// header, if the request comes directly from a trusted proxy network and the
+// user is allowed. The header is ignored for requests from anywhere else.
+func (m *basicAuthAndSessionMiddleware) attemptProxyAuth(r *http.Request) (string, bool) {
+	if m.guiCfg.ProxyAuthHeader == "" || len(m.proxyAuthNets) == 0 {
+		return "", false
+	}
+	username := strings.TrimSpace(r.Header.Get(m.guiCfg.ProxyAuthHeader))
+	if username == "" {
+		return "", false
+	}
+
+	addrPort, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil {
+		return "", false
+	}
+	addr := addrPort.Addr().Unmap()
+	if !slices.ContainsFunc(m.proxyAuthNets, func(p netip.Prefix) bool { return p.Contains(addr) }) {
+		slog.Debug("Ignoring proxy auth header from untrusted address", slogutil.Address(addr.String()))
+		return "", false
+	}
+
+	if !isAllowedProxyUser(username, m.guiCfg.ProxyAuthAllowedUsers) {
+		emitLoginAttempt(false, username, r, m.evLogger)
+		return "", false
+	}
+	return username, true
+}
+
+// isAllowedProxyUser reports whether username is in the comma separated
+// allowed list. An empty list allows everyone the proxy lets through.
+func isAllowedProxyUser(username, allowed string) bool {
+	if strings.TrimSpace(allowed) == "" {
+		return true
+	}
+	for _, u := range strings.Split(allowed, ",") {
+		if strings.TrimSpace(u) == username {
+			return true
+		}
+	}
+	return false
 }
 
 func attemptBasicAuth(r *http.Request, guiCfg config.GUIConfiguration, ldapCfg config.LDAPConfiguration, evLogger events.Logger) (string, bool) {

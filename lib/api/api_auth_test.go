@@ -8,12 +8,15 @@ package api
 
 import (
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/syncthing/syncthing/internal/db"
 	"github.com/syncthing/syncthing/internal/db/sqlite"
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/events"
 )
 
 var guiCfg config.GUIConfiguration
@@ -189,5 +192,74 @@ func TestSessionCookieMaxAgeNoExpiry(t *testing.T) {
 	}
 	if got := m.sessionCookieMaxAge(); got != math.MaxInt32 {
 		t.Fatalf("unexpected max age %d", got)
+	}
+}
+
+func TestProxyAuth(t *testing.T) {
+	t.Parallel()
+
+	mdb, err := sqlite.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		mdb.Close()
+	})
+	kdb := db.NewMiscDB(mdb)
+
+	cfg := guiCfg
+	cfg.APIKey = "testapikey"
+	cfg.ProxyAuthHeader = "Remote-User"
+	cfg.ProxyAuthTrustedNets = "192.0.2.10/32, 2001:db8::/64, not-a-network"
+	cfg.ProxyAuthAllowedUsers = "alice, bob"
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	cases := []struct {
+		name       string
+		cfg        func(c *config.GUIConfiguration)
+		remoteAddr string
+		headers    map[string]string
+		wantStatus int
+		wantCookie bool
+	}{
+		{"trusted proxy", nil, "192.0.2.10:1234", map[string]string{"Remote-User": "alice"}, http.StatusOK, true},
+		{"trusted proxy, ipv6", nil, "[2001:db8::1]:1234", map[string]string{"Remote-User": "bob"}, http.StatusOK, true},
+		{"trusted proxy, ipv4 mapped", nil, "[::ffff:192.0.2.10]:1234", map[string]string{"Remote-User": "alice"}, http.StatusOK, true},
+		{"untrusted source", nil, "192.0.2.11:1234", map[string]string{"Remote-User": "alice"}, http.StatusForbidden, false},
+		{"trusted proxy, no header", nil, "192.0.2.10:1234", nil, http.StatusForbidden, false},
+		{"trusted proxy, user not allowed", nil, "192.0.2.10:1234", map[string]string{"Remote-User": "printer"}, http.StatusForbidden, false},
+		{"any user allowed", func(c *config.GUIConfiguration) { c.ProxyAuthAllowedUsers = "" }, "192.0.2.10:1234", map[string]string{"Remote-User": "printer"}, http.StatusOK, true},
+		{"disabled without header name", func(c *config.GUIConfiguration) { c.ProxyAuthHeader = "" }, "192.0.2.10:1234", map[string]string{"Remote-User": "alice"}, http.StatusForbidden, false},
+		{"disabled without trusted nets", func(c *config.GUIConfiguration) { c.ProxyAuthTrustedNets = "" }, "192.0.2.10:1234", map[string]string{"Remote-User": "alice"}, http.StatusForbidden, false},
+		{"api key still works", nil, "192.0.2.11:1234", map[string]string{"X-API-Key": "testapikey"}, http.StatusOK, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := cfg
+			if tc.cfg != nil {
+				tc.cfg(&c)
+			}
+			tcm := newTokenCookieManager("TESTID", c, events.NoopLogger, kdb)
+			mw := newBasicAuthAndSessionMiddleware(tcm, c, config.LDAPConfiguration{}, next, events.NoopLogger)
+
+			req := httptest.NewRequest(http.MethodGet, "/rest/system/status", nil)
+			req.RemoteAddr = tc.remoteAddr
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			rec := httptest.NewRecorder()
+			mw.ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if gotCookie := len(rec.Result().Cookies()) > 0; gotCookie != tc.wantCookie {
+				t.Errorf("session cookie set = %v, want %v", gotCookie, tc.wantCookie)
+			}
+		})
 	}
 }
